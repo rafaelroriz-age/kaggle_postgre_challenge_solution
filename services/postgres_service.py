@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from contextlib import contextmanager
 from datetime import datetime
@@ -59,6 +60,18 @@ CONTROL_TABLE_VERSION_DEPENDENCIES = (
 )
 DATA_TABLE_ROW_COUNTS_NAME = "pgdm_table_row_counts"
 DATA_TABLE_ROW_COUNTS = f"{sql_ident('public')}.{sql_ident(DATA_TABLE_ROW_COUNTS_NAME)}"
+DATA_EXPANSION_JOURNAL_NAME = "pgdm_expansion_journal"
+DATA_EXPANSION_JOURNAL = f"{sql_ident('public')}.{sql_ident(DATA_EXPANSION_JOURNAL_NAME)}"
+# Session tuning applied only inside the expansion transaction (SET LOCAL).
+# A larger work_mem keeps the SELECT DISTINCT / GROUP BY hash aggregates of the
+# recipes and of the source manifest in memory instead of spilling to temp
+# files: faster and with less temporary disk usage. Values are reverted
+# automatically at COMMIT/ROLLBACK.
+EXPANSION_SESSION_TUNING_SQL = (
+    "SET LOCAL work_mem = '256MB';\n"
+    "SET LOCAL maintenance_work_mem = '512MB';\n"
+    "SET LOCAL max_parallel_workers_per_gather = 4;\n"
+)
 LEGACY_CONTROL_TABLE_VERSIONS = f"{sql_ident(LEGACY_CONTROL_SCHEMA)}.{sql_ident('table_versions')}"
 LEGACY_CONTROL_TABLE_DELETE_AUDIT = f"{sql_ident(LEGACY_CONTROL_SCHEMA)}.{sql_ident('delete_audit')}"
 
@@ -9528,6 +9541,18 @@ CREATE TABLE IF NOT EXISTS {DATA_TABLE_ROW_COUNTS} (
 
 COMMENT ON TABLE {DATA_TABLE_ROW_COUNTS} IS
     'Contagem exata de linhas das tabelas gerenciadas pelo PGDM DB Manager.';
+
+CREATE TABLE IF NOT EXISTS {DATA_EXPANSION_JOURNAL} (
+    expansion_token text PRIMARY KEY,
+    status text NOT NULL CHECK (status IN ('committed', 'registered')),
+    request_payload jsonb NOT NULL,
+    dependency_manifest jsonb NOT NULL,
+    committed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    registered_at timestamptz
+);
+
+COMMENT ON TABLE {DATA_EXPANSION_JOURNAL} IS
+    'Durable checkpoint of cross-table expansions: written atomically with the data commit, closed after version registration.';
 """.strip()
 
     def ensure_data_database_metadata(self, database_name: str, cancel_event=None):
@@ -13739,6 +13764,7 @@ BEGIN
 END
 $pgdm_expansion_scope$;
 
+CREATE TEMP TABLE pgdm_cross_table_manifest_json ON COMMIT DROP AS
 SELECT json_build_object(
     'raw_schemas', to_json({expected_scope_array}),
     'expected_row_count', COALESCE((
@@ -13782,7 +13808,9 @@ SELECT json_build_object(
           AND attribute.attnum > 0
           AND NOT attribute.attisdropped
     ), '[]'::json)
-)::text;
+) AS manifest;
+
+SELECT manifest::text FROM pg_temp.pgdm_cross_table_manifest_json;
 """.strip()
 
     def execute_cross_table_expansion(
@@ -13997,6 +14025,23 @@ SELECT json_build_object(
             destination_lock_sql = self._build_cross_table_expansion_lock_sql(
                 prepared["destinations"]
             )
+            expansion_token = uuid.uuid4().hex
+            journal_payload = {
+                "source_database_name": database_name,
+                "source_schema_name": source_schema_name,
+                "source_table_name": source_table_name,
+                "raw_schemas": list(prepared["raw_schemas"]),
+                "source_versions": source_versions,
+                "destinations": prepared["destinations"],
+            }
+            journal_sql = (
+                f"INSERT INTO {DATA_EXPANSION_JOURNAL} ("
+                "expansion_token, status, request_payload, dependency_manifest"
+                ") SELECT "
+                f"{sql_literal(expansion_token)}, 'committed', "
+                f"{sql_literal(json.dumps(journal_payload, default=str))}::jsonb, "
+                "manifest::jsonb FROM pg_temp.pgdm_cross_table_manifest_json;"
+            )
             timing_table_sql = """
 CREATE TEMP TABLE pgdm_expansion_timings (
     sequence_number integer PRIMARY KEY,
@@ -14037,6 +14082,7 @@ FROM pg_temp.pgdm_expansion_timings;
                 + "(1, 'execute', 'Initialize database transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
                 + "SET LOCAL client_min_messages = warning;\n"
+                + EXPANSION_SESSION_TUNING_SQL
                 + "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 1;\n\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
@@ -14052,6 +14098,12 @@ FROM pg_temp.pgdm_expansion_timings;
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
                 + "\n\n".join(execution_statements)
+                + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                + "(8990, 'execute', 'Write durable expansion checkpoint', "
+                + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                + journal_sql
+                + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                + "clock_timestamp() WHERE sequence_number = 8990;\n"
                 + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(9000, 'execute', 'Commit expansion transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
@@ -14174,6 +14226,66 @@ FROM pg_temp.pgdm_expansion_timings;
             "dependency_manifest": manifest,
             "destinations": prepared["destinations"],
             "timing_report": timing_report,
+            "expansion_token": expansion_token,
+        }
+
+    # ------------------------------------------------------------------
+    # Expansion checkpoint / resume
+    # ------------------------------------------------------------------
+    def list_pending_expansion_journals(self, database_name: str, cancel_event=None) -> list[dict]:
+        """Expansions whose data COMMIT succeeded but whose version
+        registration never completed (e.g. connection lost right after
+        COMMIT). They are resumed by registering versions from the journal."""
+        self.ensure_data_database_metadata(database_name, cancel_event=cancel_event)
+        sql = (
+            "SELECT COALESCE(json_agg(json_build_object("
+            "'expansion_token', expansion_token, "
+            "'request_payload', request_payload, "
+            "'dependency_manifest', dependency_manifest, "
+            "'committed_at', committed_at) ORDER BY committed_at), '[]'::json)::text "
+            f"FROM {DATA_EXPANSION_JOURNAL} WHERE status = 'committed';"
+        )
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 -f -"
+        )
+        output = self.run_remote_command(command, stdin_text=sql, cancel_event=cancel_event)
+        for line in reversed(output.splitlines()):
+            candidate = line.strip()
+            if candidate.startswith("["):
+                return list(json.loads(candidate))
+        return []
+
+    def mark_expansion_journal_registered(self, database_name: str, expansion_token: str, cancel_event=None):
+        if not expansion_token:
+            return
+        sql = (
+            f"UPDATE {DATA_EXPANSION_JOURNAL} SET status = 'registered', "
+            "registered_at = clock_timestamp() "
+            f"WHERE expansion_token = {sql_literal(expansion_token)};"
+        )
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -q -v ON_ERROR_STOP=1 -f -"
+        )
+        self.run_remote_command(command, stdin_text=sql, cancel_event=cancel_event)
+
+    @staticmethod
+    def build_expansion_result_from_journal(journal: dict, timing_report: dict | None = None) -> dict:
+        """Rebuild the execute_cross_table_expansion() result from a durable
+        journal row so version registration can be resumed without re-running
+        (and duplicating) the data expansion."""
+        payload = dict(journal.get("request_payload") or {})
+        return {
+            "source_database_name": payload.get("source_database_name"),
+            "source_schema_name": payload.get("source_schema_name"),
+            "source_table_name": payload.get("source_table_name"),
+            "raw_schemas": list(payload.get("raw_schemas") or []),
+            "source_versions": list(payload.get("source_versions") or []),
+            "dependency_manifest": journal.get("dependency_manifest") or {},
+            "destinations": list(payload.get("destinations") or []),
+            "timing_report": timing_report if timing_report is not None else {},
+            "expansion_token": journal.get("expansion_token"),
         }
 
     def execute_sql_script(

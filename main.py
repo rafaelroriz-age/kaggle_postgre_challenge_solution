@@ -5429,6 +5429,41 @@ class App(ctk.CTk):
                 "Ensure control database metadata",
             ):
                 self.service.ensure_admin_schema(cancel_event=cancel_event)
+
+            # Failure recovery: an expansion whose data COMMIT succeeded but
+            # whose version registration was interrupted (SSH/connection loss,
+            # client crash) left a durable 'committed' checkpoint in the data
+            # database. Finish it first so no expansion is left without its
+            # version record and the committed work is never redone.
+            with self.service.expansion_timing_scope(
+                timing_report,
+                "prepare",
+                "Resume interrupted expansion checkpoints",
+            ):
+                pending_journals = self.service.list_pending_expansion_journals(
+                    database_name,
+                    cancel_event=cancel_event,
+                )
+                for journal in pending_journals:
+                    self.ui(
+                        self.update_cross_table_expansion_progress,
+                        "prepare",
+                        50,
+                        "Resuming version registration of an interrupted expansion...",
+                    )
+                    recovered_result = (
+                        self.service.build_expansion_result_from_journal(journal)
+                    )
+                    self.service.register_cross_table_expansion_versions(
+                        expansion_result=recovered_result,
+                        requested_by=expansion_request["requested_by"],
+                        workstation_name=socket.gethostname(),
+                        cancel_event=None,
+                    )
+                    self.service.mark_expansion_journal_registered(
+                        database_name,
+                        journal.get("expansion_token"),
+                    )
             self.ui(
                 self.update_cross_table_expansion_progress,
                 "prepare",
@@ -5469,6 +5504,15 @@ class App(ctk.CTk):
                     timing_report=timing_report,
                 )
             )
+            with self.service.expansion_timing_scope(
+                timing_report,
+                "version",
+                "Close durable expansion checkpoint",
+            ):
+                self.service.mark_expansion_journal_registered(
+                    database_name,
+                    result.get("expansion_token"),
+                )
 
             self.ui(
                 self.update_cross_table_expansion_progress,
